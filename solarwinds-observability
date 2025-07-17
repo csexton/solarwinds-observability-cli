@@ -1,0 +1,167 @@
+#!/usr/bin/env ruby
+
+require 'net/http'
+require 'uri'
+require 'json'
+require 'optparse'
+require 'yaml'
+
+# ANSI Color Helpers
+def colorize(text, code); "\e[#{code}m#{text}\e[0m"; end
+def blue(text); colorize(text, 34); end     # hostname
+def magenta(text); colorize(text, 35); end  # program
+def dim(text); colorize(text, 2); end       # optional severity
+
+CONFIG_PATH = File.expand_path("~/.solarwinds_observability.yml")
+
+# Default options (can be overridden by YAML or CLI)
+options = {
+  direction: 'backward',
+  page_size: 50,
+  pages: 1,
+  color: true,
+  app: nil,
+  list_apps: false,
+  json: false,
+  base_url: nil
+}
+
+OptionParser.new do |opts|
+  opts.banner = "Usage: #{$PROGRAM_NAME} <filter> [options]"
+
+  opts.on("--group GROUP", "Filter by group name") { |v| options[:group] = v }
+  opts.on("--entity-id ID", "Filter by entity ID") { |v| options[:entity_id] = v }
+  opts.on("--start-time TIME", "Start time (ISO8601 UTC)") { |v| options[:start_time] = v }
+  opts.on("--end-time TIME", "End time (ISO8601 UTC)") { |v| options[:end_time] = v }
+  opts.on("--direction DIR", "Direction (backward, forward, tail)") { |v| options[:direction] = v }
+  opts.on("--page-size N", Integer, "Logs per page (default: 50)") { |v| options[:page_size] = v }
+  opts.on("--pages N", Integer, "How many pages to fetch (default: 1)") { |v| options[:pages] = v }
+  opts.on("--app NAME", "Use API token for app NAME from config") { |v| options[:app] = v }
+  opts.on("--list-apps", "List configured apps and exit") { options[:list_apps] = true }
+  opts.on("--no-color", "Disable color output") { options[:color] = false }
+  opts.on("--json", "Output full raw JSON for each page") { options[:json] = true }
+  opts.on("--base-url URL", "Override base URL for API") { |v| options[:base_url] = v }
+end.parse!
+
+# First positional arg = filter string
+filter = ARGV.shift
+
+# Load config file
+config = if File.exist?(CONFIG_PATH)
+           YAML.load_file(CONFIG_PATH)
+         else
+           {}
+         end
+
+# Merge default CLI options from config if not passed via CLI
+config.fetch("cli_options", {}).each do |key, value|
+  sym_key = key.to_sym
+  cli_arg = "--#{key.to_s.gsub('_', '-')}"
+  options[sym_key] = value unless ARGV.any? { |arg| arg.start_with?(cli_arg) }
+end
+
+# Normalize color if it's a string
+options[:color] = options[:color].to_s != "false" if options[:color].is_a?(String)
+
+# Handle --list-apps
+if options[:list_apps]
+  if config["apps"]
+    puts "Available apps:"
+    config["apps"].each_key do |name|
+      marker = name == config["default"] ? " (default)" : ""
+      puts "  - #{name}#{marker}"
+    end
+  else
+    puts "No apps configured in #{CONFIG_PATH}"
+  end
+  exit
+end
+
+# Base API URL for SolarWinds Observability.
+#
+# The API is hosted per-region, and the base URL must match your data center.
+# According to the developer docs:
+#
+#   The API can be accessed at the URL https://api.xx-yy.cloud.solarwinds.com/,
+#   where xx-yy matches your organization's data center.
+base_url = options[:base_url] || config["base_url"]
+abort("Missing base_url: provide it in #{CONFIG_PATH} or pass with --base-url.") unless base_url
+
+# Select API token to use
+token = if options[:app]
+          config.dig("apps", options[:app]) || abort("App '#{options[:app]}' not found in config.")
+        elsif ENV["SOLARWINDS_API_TOKEN"]&.strip&.length&.positive?
+          ENV["SOLARWINDS_API_TOKEN"].strip
+        elsif config["default"]
+          config.dig("apps", config["default"]) || abort("Default app '#{config["default"]}' not found in config.")
+        else
+          abort("No API token found. Use --app, set ENV['SOLARWINDS_API_TOKEN'], or configure a default in #{CONFIG_PATH}.")
+        end
+
+abort("Missing required filter argument.\nUse: #{$PROGRAM_NAME} <filter> [options]") if filter.nil? || filter.strip.empty?
+
+def build_query_path(filter, options)
+  params = {
+    filter: filter,
+    direction: options[:direction],
+    pageSize: options[:page_size]
+  }
+  params[:group]     = options[:group]      if options[:group]
+  params[:entityId]  = options[:entity_id]  if options[:entity_id]
+  params[:startTime] = options[:start_time] if options[:start_time]
+  params[:endTime]   = options[:end_time]   if options[:end_time]
+
+  "/v1/logs?" + URI.encode_www_form(params)
+end
+
+def fetch_logs(token, base_url, path)
+  uri = URI("#{base_url}#{path}")
+  req = Net::HTTP::Get.new(uri)
+  req['Authorization'] = "Bearer #{token}"
+  req['accept'] = 'application/json'
+  Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) { |http| http.request(req) }
+end
+
+# Main loop
+path = build_query_path(filter, options)
+page = 1
+
+while page <= options[:pages]
+  puts "\n--- Page #{page} ---" if options[:pages] > 1
+
+  response = fetch_logs(token, base_url, path)
+
+  unless response.is_a?(Net::HTTPSuccess)
+    warn "Error #{response.code}: #{response.message}"
+    warn response.body
+    exit 1
+  end
+
+  data = JSON.parse(response.body)
+
+  if options[:json]
+    puts JSON.pretty_generate(data)
+  else
+    logs = data['logs'] || []
+
+    if logs.empty?
+      puts "No logs found on page #{page}."
+    else
+      logs.each do |log|
+        ts   = log['time']
+        host = options[:color] ? blue(log['hostname']) : log['hostname']
+        prog = options[:color] ? magenta(log['program']) : log['program']
+        sev  = log['severity']
+        msg  = log['message'].gsub(/\s+/, ' ').strip
+
+        puts "[#{ts}] #{host} #{prog} #{sev}: #{msg}"
+      end
+    end
+  end
+
+  next_page = data.dig('pageInfo', 'nextPage')
+  break unless next_page
+
+  path = next_page
+  page += 1
+end
