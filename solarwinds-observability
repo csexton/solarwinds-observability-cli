@@ -14,7 +14,10 @@ def dim(text); colorize(text, 2); end       # optional severity
 
 CONFIG_PATH = File.expand_path("~/.solarwinds_observability.yml")
 
-# Default options (can be overridden by YAML or CLI)
+# Load config file first so CLI overrides it
+config = File.exist?(CONFIG_PATH) ? YAML.load_file(CONFIG_PATH) : {}
+
+# Establish base defaults
 options = {
   direction: 'backward',
   page_size: 50,
@@ -26,6 +29,10 @@ options = {
   base_url: nil
 }
 
+# Merge CLI defaults from config
+options.merge!(config.fetch("cli_options", {}).transform_keys(&:to_sym))
+
+# Now parse CLI arguments to override config
 OptionParser.new do |opts|
   opts.banner = "Usage: #{$PROGRAM_NAME} <filter> [options]"
 
@@ -46,23 +53,6 @@ end.parse!
 # First positional arg = filter string
 filter = ARGV.shift
 
-# Load config file
-config = if File.exist?(CONFIG_PATH)
-           YAML.load_file(CONFIG_PATH)
-         else
-           {}
-         end
-
-# Merge default CLI options from config if not passed via CLI
-config.fetch("cli_options", {}).each do |key, value|
-  sym_key = key.to_sym
-  cli_arg = "--#{key.to_s.gsub('_', '-')}"
-  options[sym_key] = value unless ARGV.any? { |arg| arg.start_with?(cli_arg) }
-end
-
-# Normalize color if it's a string
-options[:color] = options[:color].to_s != "false" if options[:color].is_a?(String)
-
 # Handle --list-apps
 if options[:list_apps]
   if config["apps"]
@@ -78,25 +68,20 @@ if options[:list_apps]
 end
 
 # Base API URL for SolarWinds Observability.
-#
-# The API is hosted per-region, and the base URL must match your data center.
-# According to the developer docs:
-#
-#   The API can be accessed at the URL https://api.xx-yy.cloud.solarwinds.com/,
-#   where xx-yy matches your organization's data center.
 base_url = options[:base_url] || config["base_url"]
 abort("Missing base_url: provide it in #{CONFIG_PATH} or pass with --base-url.") unless base_url
 
 # Select API token to use
-token = if options[:app]
-          config.dig("apps", options[:app]) || abort("App '#{options[:app]}' not found in config.")
-        elsif ENV["SOLARWINDS_API_TOKEN"]&.strip&.length&.positive?
-          ENV["SOLARWINDS_API_TOKEN"].strip
-        elsif config["default"]
-          config.dig("apps", config["default"]) || abort("Default app '#{config["default"]}' not found in config.")
-        else
-          abort("No API token found. Use --app, set ENV['SOLARWINDS_API_TOKEN'], or configure a default in #{CONFIG_PATH}.")
-        end
+token =
+  if options[:app]
+    config.dig("apps", options[:app]) || abort("App '#{options[:app]}' not found in config.")
+  elsif ENV["SOLARWINDS_API_TOKEN"]&.strip&.length&.positive?
+    ENV["SOLARWINDS_API_TOKEN"].strip
+  elsif config["default"]
+    config.dig("apps", config["default"]) || abort("Default app '#{config["default"]}' not found in config.")
+  else
+    abort("No API token found. Use --app, set ENV['SOLARWINDS_API_TOKEN'], or configure a default in #{CONFIG_PATH}.")
+  end
 
 abort("Missing required filter argument.\nUse: #{$PROGRAM_NAME} <filter> [options]") if filter.nil? || filter.strip.empty?
 
@@ -165,3 +150,4 @@ while page <= options[:pages]
   path = next_page
   page += 1
 end
+
